@@ -1,0 +1,88 @@
+name: Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  IMAGE_NAME: sample-app
+  REGISTRY: registry.local:5000
+  KUBE_NAMESPACE: production
+
+jobs:
+
+  build:
+    name: Build & Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --no-build --verbosity normal
+
+  docker:
+    name: Build & Push Docker Image
+    runs-on: self-hosted
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker Login
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login $REGISTRY -u ${{ secrets.REGISTRY_USER }} --password-stdin
+
+      - name: Build Image
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:${{ github.sha }} .
+          docker tag $REGISTRY/$IMAGE_NAME:${{ github.sha }} $REGISTRY/$IMAGE_NAME:latest
+
+      - name: Push Image
+        run: |
+          docker push $REGISTRY/$IMAGE_NAME:${{ github.sha }}
+          docker push $REGISTRY/$IMAGE_NAME:latest
+
+  security_scan:
+    name: Security Scan
+    runs-on: self-hosted
+    needs: docker
+
+    steps:
+      - name: Scan Image
+        run: |
+          trivy image $REGISTRY/$IMAGE_NAME:latest || exit 1
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: self-hosted
+    needs: security_scan
+
+    steps:
+      - name: Set Kubernetes Context
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Deploy
+        run: |
+          kubectl set image deployment/sample-app sample-app=$REGISTRY/$IMAGE_NAME:latest -n $KUBE_NAMESPACE
+          kubectl rollout status deployment/sample-app -n $KUBE_NAMESPACE
+
+  rollback:
+    name: Rollback (Manual)
+    runs-on: self-hosted
+    if: failure()
+    steps:
+      - name: Rollback Deployment
+        run: |
+          kubectl rollout undo deployment/sample-app -n $KUBE_NAMESPACE
